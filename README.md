@@ -1,169 +1,70 @@
-# Rate Limiter
+# rate-limiter
 
-A rate limiter implementation using TypeScript and Redis.
+A distributed rate limiter for Node.js. Every app instance shares one Redis. Each decision is a single Lua script, so concurrent requests from different instances can't race between reading the count and recording the request.
 
-## Features
-- **Fixed window rate limiting**: Limits the number of requests a user can make within a fixed time window.
-- **Configurable limit and window size**: Set the maximum number of requests and the time window in milliseconds.
-- **Redis-backed**: Supports distributed rate limiting using Redis.
-- **Atomic operations**: Uses Lua scripts for atomic Redis operations.
-- **Automatic cleanup**: Sets TTL on Redis keys to automatically clean up old data.
+**Algorithm:** sliding-window log &nbsp;·&nbsp; **Stack:** TypeScript, ioredis, Redis, Jest
 
-## Installation
+## How it works
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/olayanju-1234/rate-limiter.git
-   cd rate-limiter
-   ```
+Each client key (user id, API key, IP) is a Redis sorted set of request timestamps. For every request, one Lua script runs these steps:
 
-2. Install dependencies:
-   ```bash
-   yarn install
-   ```
+```mermaid
+flowchart LR
+    A["allowRequest(id)"] --> B["ZREMRANGEBYSCORE<br/>drop timestamps older<br/>than now − window"]
+    B --> C["ZCOUNT<br/>requests still in window"]
+    C -->|under limit| D["ZADD now<br/>EXPIRE window"]
+    D --> E["return 1 · allowed"]
+    C -->|limit reached| F["return 0 · denied"]
+```
 
-3. Start Redis:
-   Ensure Redis is running locally or update the Redis connection settings in the code.
+Redis executes a script as one command, so the trim, count and add happen atomically. Two app instances serving the same client at the same moment can't both see `limit − 1` and both let a request through. The `EXPIRE` lets idle keys clean themselves up. Denied requests aren't recorded, so a client that keeps retrying is only held back until its oldest request ages out.
+
+### Why a sliding log rather than a fixed window
+
+A fixed-window counter (`INCR` + `EXPIRE`) is cheaper, but it allows up to twice the limit across a window boundary: `limit` requests at 0:59 and `limit` more at 1:00. The sliding log counts exactly the last `windowSize` milliseconds at every instant. It costs O(limit) memory per active key instead of one integer, which is fine for per-user API limits. For very high limits, a token bucket or sliding-window counter is the better trade.
 
 ## Usage
 
-### Basic Usage
+```typescript
+import Redis from 'ioredis';
+import RateLimiter from './RateLimiter';
+
+const redis = new Redis(process.env.REDIS_URL);
+const limiter = new RateLimiter({ limit: 5, windowSize: 60_000 }, redis); // 5 requests per minute
+
+const allowed = await limiter.allowRequest('user-42');
+```
+
+| Option | Meaning |
+|--------|---------|
+| `limit` | Maximum requests allowed inside any window |
+| `windowSize` | Window length in milliseconds. Use a whole number of seconds (see limitations) |
+
+### As Express middleware
 
 ```typescript
-import RateLimiter from './RateLimiter';
-import Redis from 'ioredis';
-
-// Create a Redis instance
-const redis = new Redis();
-
-// Initialize the rate limiter with a limit of 5 requests per minute
-const rateLimiter = new RateLimiter({ limit: 5, windowSize: 60000 }, redis);
-
-// Simulate requests
-async function testRateLimiter() {
-  const userId = 'user1';
-
-  for (let i = 0; i < 6; i++) {
-    const allowed = await rateLimiter.allowRequest(userId);
-    console.log(`Request ${i + 1}: ${allowed ? 'Allowed' : 'Denied'}`);
-  }
-}
-
-testRateLimiter();
-```
-
-#### Example Output
-```
-Request 1: Allowed
-Request 2: Allowed
-Request 3: Allowed
-Request 4: Allowed
-Request 5: Allowed
-Request 6: Denied
-```
-
-### Integration with Express
-
-You can integrate the rate limiter into an Express application as middleware:
-
-```typescript
-import express from 'express';
-import RateLimiter from './RateLimiter';
-import Redis from 'ioredis';
-
-const redis = new Redis();
-const rateLimiter = new RateLimiter({ limit: 5, windowSize: 60000 }, redis);
-
-const app = express();
-
 app.use(async (req, res, next) => {
-  const userId = req.ip; // Use IP address as the user identifier
-  const allowed = await rateLimiter.allowRequest(userId);
-
-  if (allowed) {
-    next();
-  } else {
-    res.status(429).json({ message: 'Too many requests' });
-  }
-});
-
-app.get('/', (req, res) => {
-  res.json({ message: 'Hello, world!' });
-});
-
-app.listen(3000, () => {
-  console.log('Server running on port 3000');
+  const allowed = await limiter.allowRequest(req.ip ?? 'anonymous');
+  if (!allowed) return res.status(429).json({ message: 'Too many requests' });
+  next();
 });
 ```
 
-## Configuration
-
-The `RateLimiter` constructor accepts a configuration object with the following properties:
-
-- `limit`: The maximum number of requests allowed in the time window.
-- `windowSize`: The time window in milliseconds (e.g., 60000 for 1 minute).
-
-#### Example:
-
-```typescript
-const rateLimiter = new RateLimiter({ limit: 10, windowSize: 60000 }, redis);
-```
-
-## Testing
-
-Run the tests using Jest:
+## Run it
 
 ```bash
-yarn test
+docker run --rm -d -p 6379:6379 redis:7   # throwaway Redis: the tests call FLUSHALL
+npm install
+npm test                                  # allows 5, denies the 6th
+npm run build && npm start                # demo: 10 requests against a limit of 5
 ```
 
-#### Test Output
-```
-PASS  src/__tests__/RateLimiter.test.ts
-  RateLimiter - Redis
-    ✓ should allow requests within the limit (87 ms)
-    ✓ should deny requests beyond the limit (22 ms)
+## Known limitations
 
-Test Suites: 1 passed, 1 total
-Tests:       2 passed, 2 total
-Snapshots:   0 total
-Time:        2.345 s
-Ran all test suites.
-```
-
-## Deployment
-
-1. **Build the Project:**
-   ```bash
-   yarn build
-   ```
-2. **Run the Application:**
-   ```bash
-   yarn start
-   ```
-3. **Deploy to Production:**
-   Deploy the application to your preferred platform (e.g., AWS, Heroku, Docker).
-
-## Monitoring
-
-- Use tools like **Prometheus** or **Datadog** to monitor rate-limiting events and Redis performance.
-- Set up alerts for high request rates or Redis connection issues.
-
-## Contributing
-
-Contributions are welcome! Please follow these steps:
-
-1. Fork the repository.
-2. Create a new branch for your feature or bugfix.
-3. Commit your changes.
-4. Submit a pull request.
+- **Same-millisecond requests.** The sorted-set member is the timestamp itself, so two allowed requests for one key in the same millisecond collapse into one entry. Using `timestamp-random` as the member fixes it.
+- **Whole-second windows.** The TTL is set with `EXPIRE windowSize / 1000`, so a window like 1,500 ms makes Redis reject the script. Switching to `PEXPIRE` allows any window.
+- **Script sent on every call.** Registering it once with `defineCommand` (`EVALSHA`) would save bandwidth.
 
 ## License
 
-This project is licensed under the **MIT License**. See the LICENSE file for details.
-
-## Acknowledgments
-
-- Inspired by various rate-limiting algorithms and Redis best practices.
-- Built with ❤️ using TypeScript and Redis.
-
+MIT
