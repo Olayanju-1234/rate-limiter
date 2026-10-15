@@ -6,18 +6,18 @@ A distributed rate limiter for Node.js. Every app instance shares one Redis. Eac
 
 ## How it works
 
-Each client key (user id, API key, IP) is a Redis sorted set of request timestamps. For every request, one Lua script runs these steps:
+Each client key (user id, API key, IP) is a Redis sorted set with one entry per allowed request. The score is the request's timestamp and the member is that timestamp plus a random suffix, so two requests in the same millisecond are counted as two. For every request, one Lua script runs these steps:
 
 ```mermaid
 flowchart LR
     A["allowRequest(id)"] --> B["ZREMRANGEBYSCORE<br/>drop timestamps older<br/>than now − window"]
     B --> C["ZCOUNT<br/>requests still in window"]
-    C -->|under limit| D["ZADD now<br/>EXPIRE window"]
+    C -->|under limit| D["ZADD now, now-suffix<br/>PEXPIRE window"]
     D --> E["return 1 · allowed"]
     C -->|limit reached| F["return 0 · denied"]
 ```
 
-Redis executes a script as one command, so the trim, count and add happen atomically. Two app instances serving the same client at the same moment can't both see `limit − 1` and both let a request through. The `EXPIRE` lets idle keys clean themselves up. Denied requests aren't recorded, so a client that keeps retrying is only held back until its oldest request ages out.
+Redis executes a script as one command, so the trim, count and add happen atomically. Two app instances serving the same client at the same moment can't both see `limit − 1` and both let a request through. The `PEXPIRE` lets idle keys clean themselves up, at millisecond precision, so any window length works. The script is registered once with ioredis `defineCommand`, so each call sends only its SHA (`EVALSHA`) and ioredis reloads it if Redis has dropped it. Denied requests aren't recorded, so a client that keeps retrying is only held back until its oldest request ages out.
 
 ### Why a sliding log rather than a fixed window
 
@@ -38,7 +38,7 @@ const allowed = await limiter.allowRequest('user-42');
 | Option | Meaning |
 |--------|---------|
 | `limit` | Maximum requests allowed inside any window |
-| `windowSize` | Window length in milliseconds. Use a whole number of seconds (see limitations) |
+| `windowSize` | Window length in milliseconds, e.g. `1500` |
 
 ### As Express middleware
 
@@ -55,15 +55,13 @@ app.use(async (req, res, next) => {
 ```bash
 docker run --rm -d -p 6379:6379 redis:7   # throwaway Redis: the tests call FLUSHALL
 npm install
-npm test                                  # allows 5, denies the 6th
+npm test                                  # limit, same-millisecond bursts, 1.5 s window
 npm run build && npm start                # demo: 10 requests against a limit of 5
 ```
 
 ## Known limitations
 
-- **Same-millisecond requests.** The sorted-set member is the timestamp itself, so two allowed requests for one key in the same millisecond collapse into one entry. Using `timestamp-random` as the member fixes it.
-- **Whole-second windows.** The TTL is set with `EXPIRE windowSize / 1000`, so a window like 1,500 ms makes Redis reject the script. Switching to `PEXPIRE` allows any window.
-- **Script sent on every call.** Registering it once with `defineCommand` (`EVALSHA`) would save bandwidth.
+- **Clock comes from the app.** `now` is each instance's `Date.now()`, so clock skew between instances shifts their windows by that much. Reading Redis `TIME` inside the script would give every instance one clock.
 
 ## License
 
