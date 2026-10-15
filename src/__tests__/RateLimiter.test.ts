@@ -11,6 +11,7 @@ describe('RateLimiter - Redis', () => {
   });
 
   afterEach(async () => {
+    jest.restoreAllMocks();
     // Clear Redis data after each test
     await redis.flushall();
   }, 10000); // 10 seconds timeout
@@ -36,4 +37,30 @@ describe('RateLimiter - Redis', () => {
     }
     expect(await rateLimiter.allowRequest('user1')).toBe(false);
   }, 10000); // 10 seconds timeout
+
+  it('should count requests made in the same millisecond separately', async () => {
+    jest.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
+
+    for (let i = 0; i < 5; i++) {
+      expect(await rateLimiter.allowRequest('user1')).toBe(true);
+    }
+    expect(await redis.zcard('rate-limiter:user1')).toBe(5);
+    expect(await rateLimiter.allowRequest('user1')).toBe(false);
+  });
+
+  it('should support windows that are not a whole number of seconds', async () => {
+    const now = jest.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
+    const limiter = new RateLimiter({ limit: 2, windowSize: 1500 }, redis);
+
+    expect(await limiter.allowRequest('user1')).toBe(true);
+    expect(await limiter.allowRequest('user1')).toBe(true);
+    expect(await limiter.allowRequest('user1')).toBe(false);
+
+    const ttl = await redis.pttl('rate-limiter:user1');
+    expect(ttl).toBeGreaterThan(1000);
+    expect(ttl).toBeLessThanOrEqual(1500);
+
+    now.mockReturnValue(1_700_000_001_500);
+    expect(await limiter.allowRequest('user1')).toBe(true);
+  });
 });
